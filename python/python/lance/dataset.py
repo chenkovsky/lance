@@ -2203,6 +2203,13 @@ class LanceDataset(pa.dataset.Dataset):
         ds._default_scan_options = None
         return ds
 
+    @staticmethod
+    def drop(
+        base_uri: Union[str, Path],
+        storage_options: Optional[Dict[str, str]] = None
+    ) -> None:
+        _Dataset.drop(str(base_uri), storage_options)
+
     def validate(self):
         """
         Validate the dataset.
