@@ -1982,10 +1982,8 @@ impl FragmentReader {
             == self.output_schema.fields.len()
         {
             let selected_rows = params
-                .slice(0, total_num_rows as usize)
-                .unwrap()
-                .to_offsets()
-                .unwrap()
+                .slice(0, total_num_rows as usize)?
+                .to_offsets()?
                 .len();
             let tasks = (0..selected_rows)
                 .step_by(batch_size as usize)
