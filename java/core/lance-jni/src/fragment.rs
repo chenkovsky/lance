@@ -225,7 +225,8 @@ fn create_fragment<'a>(
 const DATA_FILE_CLASS: &str = "com/lancedb/lance/DataFile";
 const DATA_FILE_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;[I[III)V";
 const DELETE_FILE_CLASS: &str = "com/lancedb/lance/DeletionFile";
-const DELETE_FILE_CONSTRUCTOR_SIG: &str = "(JJLjava/lang/Long;Lcom/lancedb/lance/DeletionFileType;)V";
+const DELETE_FILE_CONSTRUCTOR_SIG: &str =
+    "(JJLjava/lang/Long;Lcom/lancedb/lance/DeletionFileType;)V";
 const DELETE_FILE_TYPE_CLASS: &str = "com/lancedb/lance/DeletionFileType";
 const FRAGMENT_METADATA_CLASS: &str = "com/lancedb/lance/FragmentMetadata";
 const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str ="(ILjava/util/List;Ljava/lang/Long;Lcom/lancedb/lance/DeletionFile;Lcom/lancedb/lance/RowIdMeta;)V";
@@ -257,11 +258,15 @@ impl IntoJava for &DeletionFileType {
             lance::table::format::DeletionFileType::Array => "ARRAY",
             lance::table::format::DeletionFileType::Bitmap => "BITMAP",
         };
-        env.get_static_field(DELETE_FILE_TYPE_CLASS, name, format!("L{};", DELETE_FILE_TYPE_CLASS))?
-            .l()
-            .map_err(|e| {
-                Error::runtime_error(format!("failed to get {}: {}", DELETE_FILE_TYPE_CLASS, e))
-            })
+        env.get_static_field(
+            DELETE_FILE_TYPE_CLASS,
+            name,
+            format!("L{};", DELETE_FILE_TYPE_CLASS),
+        )?
+        .l()
+        .map_err(|e| {
+            Error::runtime_error(format!("failed to get {}: {}", DELETE_FILE_TYPE_CLASS, e))
+        })
     }
 }
 
@@ -364,12 +369,26 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
         } else {
             Some(deletion_file.extract_object(env)?)
         };
+
+        let row_id_meta = env
+            .call_method(
+                self,
+                "getRowIdMeta",
+                format!("()L{};", ROW_ID_META_CLASS),
+                &[],
+            )?
+            .l()?;
+        let row_id_meta = if row_id_meta.is_null() {
+            None
+        } else {
+            Some(row_id_meta.extract_object(env)?)
+        };
         Ok(Fragment {
             id,
             files,
             deletion_file,
             physical_rows: Some(physical_rows),
-            row_id_meta: None,
+            row_id_meta,
         })
     }
 }
