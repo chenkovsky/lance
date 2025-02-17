@@ -59,8 +59,8 @@ pub struct PostingIterator {
     list: PostingList,
     index: usize,
     mask: Arc<RowIdMask>,
+    approximate_upper_bound: f32,
     len: usize,
-    max_score: f32,
 }
 
 impl PartialEq for PostingIterator {
@@ -121,15 +121,15 @@ impl PostingIterator {
             list,
             index,
             mask,
+            approximate_upper_bound: stat.max_score(),
             len: stat.len,
-            max_score: stat.max_score(),
         }
     }
 
 
     #[inline]
     fn approximate_upper_bound(&self) -> f32 {
-        self.max_score
+        self.approximate_upper_bound
     }
 
     fn doc(&self) -> Option<DocInfo> {
