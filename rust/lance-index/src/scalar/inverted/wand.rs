@@ -17,13 +17,50 @@ use super::index::{idf, K1};
 use super::{DocInfo, PostingList};
 
 #[derive(Clone)]
+pub struct PostingStatistics {
+    num_docs: usize,
+    len: usize,
+    max_score: f32,
+}
+
+impl PostingStatistics {
+    pub fn new(num_docs: usize, len: usize, max_score: f32) -> Self {
+        let max_score = max_score / (idf(len, num_docs) * (K1 + 1.0));
+        Self { num_docs, len, max_score, }
+    }
+
+    pub fn merge(&mut self, stats: &PostingStatistics) -> &mut Self {
+        self.num_docs += stats.num_docs;
+        self.len += stats.len;
+        self.max_score = self.max_score.max(stats.max_score);
+        self
+    }
+
+    #[inline]
+    pub fn num_docs(&self) -> usize {
+        self.num_docs
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub fn max_score(&self) -> f32 {
+        self.max_score * (idf(self.len, self.num_docs) * (K1 + 1.0))
+    }
+}
+
+#[derive(Clone)]
 pub struct PostingIterator {
     token_id: u32,
     position: i32,
     list: PostingList,
     index: usize,
     mask: Arc<RowIdMask>,
-    approximate_upper_bound: f32,
+    len: usize,
+    max_score: f32,
 }
 
 impl PartialEq for PostingIterator {
@@ -58,10 +95,18 @@ impl PostingIterator {
         list: PostingList,
         num_doc: usize,
         mask: Arc<RowIdMask>,
+        stat: Option<PostingStatistics>
     ) -> Self {
-        let approximate_upper_bound = match list.max_score() {
-            Some(max_score) => max_score,
-            None => idf(list.len(), num_doc) * (K1 + 1.0),
+        let stat = match stat {
+            Some(stat) => stat,
+            None => {
+                let len = list.len();
+                let max_score = match list.max_score() {
+                    Some(max_score) => max_score,
+                    None => idf(len, num_doc) * (K1 + 1.0),
+                };
+                PostingStatistics::new(num_doc,len, max_score)
+            }
         };
 
         // move the iterator to the first selected document. This is important
@@ -70,20 +115,21 @@ impl PostingIterator {
         while index < list.len() && !mask.selected(list.row_id(index)) {
             index += 1;
         }
-
         Self {
             token_id,
             position,
             list,
             index,
             mask,
-            approximate_upper_bound,
+            len: stat.len,
+            max_score: stat.max_score(),
         }
     }
 
+
     #[inline]
     fn approximate_upper_bound(&self) -> f32 {
-        self.approximate_upper_bound
+        self.max_score
     }
 
     fn doc(&self) -> Option<DocInfo> {
@@ -192,7 +238,7 @@ impl Wand {
                 break;
             }
             debug_assert!(cur_doc.row_id == doc_id);
-            let idf = idf(posting.list.len(), self.num_docs);
+            let idf = idf(posting.len, self.num_docs);
             score += idf * (K1 + 1.0) * scorer(doc_id, cur_doc.frequency);
         }
         score

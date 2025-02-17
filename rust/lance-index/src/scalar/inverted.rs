@@ -10,6 +10,7 @@ pub use builder::InvertedIndexBuilder;
 pub use index::*;
 use lance_core::Result;
 pub use tokenizer::*;
+pub use wand::PostingStatistics;
 
 use super::btree::TrainingSource;
 use super::{IndexStore, InvertedIndexParams};

@@ -15,8 +15,9 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::stream::{self};
 use futures::{StreamExt, TryStreamExt};
+use lance_index::as_inverted_index;
 use lance_index::prefilter::{FilterLoader, PreFilter};
-use lance_index::scalar::inverted::{flat_bm25_search_stream, InvertedIndex, FTS_SCHEMA};
+use lance_index::scalar::inverted::{flat_bm25_search_stream, InvertedIndex, FTS_SCHEMA, PostingStatistics};
 use lance_index::scalar::FullTextSearchQuery;
 use lance_table::format::Index;
 use tracing::instrument;
@@ -26,6 +27,46 @@ use crate::{index::DatasetIndexInternalExt, Dataset};
 
 use super::utils::{FilteredRowIdsToPrefilter, SelectionVectorToPrefilter};
 use super::PreFilterSource;
+
+
+struct IndexStatistics {
+    total_tokens: u64,
+    total_docs: usize,
+    postings: HashMap<String, PostingStatistics>
+}
+
+impl IndexStatistics {
+    async fn collect(tokens: &Vec<String>, ds: &Dataset, column: &String, indices: &Vec<Index>) -> DataFusionResult<Self> {
+        let mut postings: HashMap<String, PostingStatistics> = HashMap::new();
+        let mut total_tokens = 0;
+        let mut total_docs = 0;
+        for index in indices {
+            let uuid = index.uuid.to_string();
+            let index = ds.open_generic_index(&column, &uuid).await?;
+            let index: &InvertedIndex = as_inverted_index!(index, uuid)?;
+            total_tokens += index.total_tokens();
+            total_docs += index.total_docs();
+            for token in tokens {
+                let posting_stats = index.posting_stats(token);
+                if let Some(posting_stats) = posting_stats {
+                    match postings.get_mut(token) {
+                        Some(stats) => {
+                            stats.merge(&posting_stats);
+                        },
+                        None => {
+                            postings.insert(token.to_string(), posting_stats);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Self{
+            total_tokens,
+            total_docs,
+            postings,
+        })
+    }
+}
 
 /// An execution node that performs full text search
 ///
@@ -184,16 +225,7 @@ impl ExecutionPlan for FtsExec {
                         ));
 
                         let index = ds.open_generic_index(&column, &uuid).await?;
-                        let index =
-                            index
-                                .as_any()
-                                .downcast_ref::<InvertedIndex>()
-                                .ok_or_else(|| {
-                                    DataFusionError::Execution(format!(
-                                        "Index {} is not an inverted index",
-                                        uuid,
-                                    ))
-                                })?;
+                        let index = as_inverted_index!(index, uuid)?;
                         pre_filter.wait_for_ready().await?;
                         let results = index.full_text_search(&query, pre_filter).await?;
 
@@ -336,16 +368,7 @@ impl ExecutionPlan for FlatFtsExec {
 
                 async move {
                     let index = ds.open_generic_index(&column, &uuid).await?;
-                    let index =
-                        index
-                            .as_any()
-                            .downcast_ref::<InvertedIndex>()
-                            .ok_or_else(|| {
-                                DataFusionError::Execution(format!(
-                                    "Index {} is not an inverted index",
-                                    uuid,
-                                ))
-                            })?;
+                    let index = as_inverted_index!(index, uuid)?;
 
                     let unindexed_stream = input.execute(partition, context)?;
                     let unindexed_result_stream =

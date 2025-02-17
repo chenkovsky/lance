@@ -69,6 +69,28 @@ lazy_static! {
         .unwrap_or(512 * 1024 * 1024);
 }
 
+#[macro_export]
+macro_rules! as_inverted_index {
+    ($index:expr, $uuid:expr) => {
+        $index
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Index {} is not an inverted index",
+                    $uuid,
+                ))
+            })
+    };
+}
+
+#[derive(Clone)]
+pub struct ParsedQuery<'a> {
+    raw: &'a FullTextSearchQuery,
+    tokens: Vec<String>,
+    postings: HashMap<String, PostingStatistics>,
+}
+
 #[derive(Clone)]
 pub struct InvertedIndex {
     params: InvertedIndexParams,
@@ -108,16 +130,30 @@ impl InvertedIndex {
     }
 
     #[instrument(level = "debug", skip_all)]
-    pub async fn full_text_search(
-        &self,
-        query: &FullTextSearchQuery,
-        prefilter: Arc<dyn PreFilter>,
-    ) -> Result<Vec<(u64, f32)>> {
-        let mut tokenizer = self.tokenizer.clone();
-        let tokens = collect_tokens(&query.query, &mut tokenizer, None);
+    fn reverse_dict<'a>(&self, texts: &'a [String]) -> HashMap<u32, &'a String> {
+        texts
+        .iter()
+        .filter_map(|text| self.tokens.get(text).map(|idx| (idx, text))).collect()
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    pub fn posting_stats(&self, token: &String) -> Option<PostingStatistics> {
+        self.tokens.get(token).map(|token_id| {
+            let size = self.inverted_list.posting_len(token_id);
+            let max_score = self.inverted_list.max_scores.as_ref().map(|vec: &Vec<f32>| vec.get(token_id as usize)).flatten().unwrap_or(&0.0);
+            PostingStatistics::new(
+                self.docs.len(),
+                size,
+                *max_score,
+            )
+        })
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    fn token_ids(&self, tokens: &[String], query: &str) -> Result<Vec<u32>> {
         let token_ids = self.map(&tokens).into_iter();
-        let token_ids = if !is_phrase_query(&query.query) {
-            token_ids.sorted_unstable().dedup().collect()
+        if !is_phrase_query(&query) {
+            Ok(token_ids.sorted_unstable().dedup().collect())
         } else {
             if !self.inverted_list.has_positions() {
                 return Err(Error::Index { message: "position is not found but required for phrase queries, try recreating the index with position".to_owned(), location: location!() });
@@ -127,33 +163,75 @@ impl InvertedIndex {
             if token_ids.len() != tokens.len() {
                 return Ok(Vec::new());
             }
-            token_ids
-        };
-        self.bm25_search(token_ids, query, prefilter).await
+            Ok(token_ids)
+        }
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    pub fn parse<'a>(
+        &self,
+        raw: &'a FullTextSearchQuery
+    ) -> Result<ParsedQuery<'a>> {
+        let mut tokenizer = self.tokenizer.clone(); // TODO: avoid cloning
+        let tokens = collect_tokens(&raw.query, &mut tokenizer, None);
+        let postings = HashMap::with_capacity(tokens.len());
+        Ok(ParsedQuery{
+            raw,
+            tokens,
+            postings
+        })
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    pub async fn full_text_search(
+        &self,
+        query: &FullTextSearchQuery,
+        prefilter: Arc<dyn PreFilter>
+    ) -> Result<Vec<(u64, f32)>> {
+        let parsed = &self.parse(query)?;
+        self.parsed_search(parsed, prefilter).await
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    pub async fn parsed_search<'a>(
+        &self,
+        parsed: &ParsedQuery<'a>,
+        prefilter: Arc<dyn PreFilter>
+    ) -> Result<Vec<(u64, f32)>> {
+        let token_ids = self.token_ids(&parsed.tokens, &parsed.raw.query)?;
+        self.bm25_search(token_ids, parsed, prefilter).await
     }
 
     // search the documents that contain the query
     // return the row ids of the documents sorted by bm25 score
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
     #[instrument(level = "debug", skip_all)]
-    async fn bm25_search(
+    async fn bm25_search<'a>(
         &self,
         token_ids: Vec<u32>,
-        query: &FullTextSearchQuery,
+        query: &ParsedQuery<'a>,
         prefilter: Arc<dyn PreFilter>,
     ) -> Result<Vec<(u64, f32)>> {
-        let limit = query
+        let limit = query.raw
             .limit
             .map(|limit| limit as usize)
             .unwrap_or(usize::MAX);
-        let wand_factor = query.wand_factor.unwrap_or(1.0);
+        let wand_factor = query.raw.wand_factor.unwrap_or(1.0);
 
         let mask = prefilter.mask();
-        let is_phrase_query = is_phrase_query(&query.query);
-        let postings = stream::iter(token_ids)
+        let is_phrase_query = is_phrase_query(&query.raw.query);
+        let dict = self.reverse_dict(&query.tokens);
+        let token_stat = token_ids.into_iter().map(|token_id| {
+            let stat = match dict.get(&token_id) {
+                Some(token) => query.postings.get(*token),
+                None => None
+            };
+            (token_id, stat.cloned())
+        });
+        let postings = stream::iter(token_stat)
             .enumerate()
             .zip(repeat_with(|| (self.inverted_list.clone(), mask.clone())))
-            .map(|((position, token_id), (inverted_list, mask))| async move {
+            .map(|((position, (token_id, stat)), (inverted_list, mask))| async move {
                 let posting = inverted_list
                     .posting_list(token_id, is_phrase_query)
                     .await?;
@@ -163,6 +241,7 @@ impl InvertedIndex {
                     posting,
                     self.docs.len(),
                     mask,
+                    stat,
                 ))
             })
             // Use compute count since data hopefully cached
@@ -184,6 +263,14 @@ impl InvertedIndex {
         let inverted_list = self.inverted_list.clone();
         let docs = self.docs.clone();
         InvertedIndexBuilder::from_existing_index(self.params.clone(), tokens, inverted_list, docs)
+    }
+
+    pub fn total_tokens(&self) -> u64 {
+        self.docs.total_tokens
+    }
+
+    pub fn total_docs(&self) -> usize {
+        self.docs.len()
     }
 }
 
