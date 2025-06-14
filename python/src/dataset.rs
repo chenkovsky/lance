@@ -76,6 +76,7 @@ use lance_table::io::commit::CommitHandler;
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
+use crate::indices::inverted::{PyBM25Scorer, PyInvertedIndex};
 use crate::scanner::ScanStatistics;
 use crate::schema::LanceSchema;
 use crate::session::Session;
@@ -572,62 +573,7 @@ impl Dataset {
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         if let Some(full_text_query) = full_text_query {
-            let fts_query = if let Ok(full_text_query) = full_text_query.downcast::<PyDict>() {
-                let mut query = full_text_query
-                    .get_item("query")?
-                    .ok_or_else(|| PyKeyError::new_err("query must be specified"))?
-                    .to_string();
-                let columns = if let Some(columns) = full_text_query.get_item("columns")? {
-                    if columns.is_none() {
-                        None
-                    } else {
-                        Some(
-                            columns
-                                .downcast::<PyList>()?
-                                .iter()
-                                .map(|c| c.extract::<String>())
-                                .collect::<PyResult<Vec<String>>>()?,
-                        )
-                    }
-                } else {
-                    None
-                };
-
-                let is_phrase = query.len() >= 2 && query.starts_with('"') && query.ends_with('"');
-                let is_multi_match = columns.as_ref().map(|cols| cols.len() > 1).unwrap_or(false);
-
-                if is_phrase {
-                    // Remove the surrounding quotes for phrase queries
-                    query = query[1..query.len() - 1].to_string();
-                }
-
-                let query: FtsQuery = match (is_phrase, is_multi_match) {
-                    (false, _) => MatchQuery::new(query).into(),
-                    (true, false) => PhraseQuery::new(query).into(),
-                    (true, true) => {
-                        return Err(PyValueError::new_err(
-                            "Phrase queries cannot be used with multiple columns.",
-                        ));
-                    }
-                };
-                let mut query = FullTextSearchQuery::new_query(query);
-                if let Some(cols) = columns {
-                    query = query.with_columns(&cols).map_err(|e| {
-                        PyValueError::new_err(format!(
-                            "Failed to set full text search columns: {}",
-                            e
-                        ))
-                    })?;
-                }
-                query
-            } else if let Ok(query) = full_text_query.downcast::<PyFullTextQuery>() {
-                let query = query.borrow();
-                FullTextSearchQuery::new_query(query.inner.clone())
-            } else {
-                return Err(PyValueError::new_err(
-                    "query must be a string or a Query object",
-                ));
-            };
+            let fts_query = parse_full_text_query(full_text_query)?;
 
             scanner
                 .full_text_search(fts_query)
@@ -1714,6 +1660,28 @@ impl Dataset {
         )));
         Ok(PyArrowType(reader))
     }
+
+    fn open_scalar_index(self_: PyRef<'_, Self>, column: &str, uuid: &str) -> PyResult<PyObject> {
+        let index = RT
+            .runtime
+            .block_on(
+                self_
+                    .ds
+                    .open_scalar_index(column, uuid, &NoOpMetricsCollector),
+            )
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        match index.index_type() {
+            IndexType::Inverted => {
+                PyInvertedIndex::new(column.to_string(), uuid.to_string(), index)
+                    .into_py_any(self_.py())
+            }
+            _ => Err(PyValueError::new_err(format!(
+                "Only inverted indices are supported, but index {} is of type {}",
+                uuid,
+                index.index_type()
+            ))),
+        }
+    }
 }
 
 #[derive(FromPyObject)]
@@ -1729,6 +1697,69 @@ impl PyWriteDest {
             Self::Uri(uri) => WriteDestination::Uri(uri),
         }
     }
+}
+
+fn parse_full_text_query(full_text_query: &Bound<'_, PyAny>) -> PyResult<FullTextSearchQuery> {
+    let fts_query = if let Ok(full_text_query) = full_text_query.downcast::<PyDict>() {
+        let mut query = full_text_query
+            .get_item("query")?
+            .ok_or_else(|| PyKeyError::new_err("query must be specified"))?
+            .to_string();
+        let columns = if let Some(columns) = full_text_query.get_item("columns")? {
+            if columns.is_none() {
+                None
+            } else {
+                Some(
+                    columns
+                        .downcast::<PyList>()?
+                        .iter()
+                        .map(|c| c.extract::<String>())
+                        .collect::<PyResult<Vec<String>>>()?,
+                )
+            }
+        } else {
+            None
+        };
+        let scorer = if let Some(scorer) = full_text_query.get_item("scorer")? {
+            Some(scorer.extract::<PyBM25Scorer>()?.inner.clone())
+        } else {
+            None
+        };
+
+        let is_phrase = query.len() >= 2 && query.starts_with('"') && query.ends_with('"');
+        let is_multi_match = columns.as_ref().map(|cols| cols.len() > 1).unwrap_or(false);
+
+        if is_phrase {
+            // Remove the surrounding quotes for phrase queries
+            query = query[1..query.len() - 1].to_string();
+        }
+
+        let query: FtsQuery = match (is_phrase, is_multi_match) {
+            (false, _) => MatchQuery::new(query).into(),
+            (true, false) => PhraseQuery::new(query).into(),
+            (true, true) => {
+                return Err(PyValueError::new_err(
+                    "Phrase queries cannot be used with multiple columns.",
+                ));
+            }
+        };
+        let mut query = FullTextSearchQuery::new_query(query);
+        query = query.with_scorer(scorer);
+        if let Some(cols) = columns {
+            query = query.with_columns(&cols).map_err(|e| {
+                PyValueError::new_err(format!("Failed to set full text search columns: {}", e))
+            })?;
+        }
+        query
+    } else if let Ok(query) = full_text_query.downcast::<PyFullTextQuery>() {
+        let query = query.borrow();
+        FullTextSearchQuery::new_query(query.inner.clone())
+    } else {
+        return Err(PyValueError::new_err(
+            "query must be a string or a Query object",
+        ));
+    };
+    Ok(fts_query)
 }
 
 impl Dataset {

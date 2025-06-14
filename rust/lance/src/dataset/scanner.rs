@@ -1837,6 +1837,17 @@ impl Scanner {
         Ok(fts_exec)
     }
 
+    fn fragments_bitmap(&self) -> Option<Arc<RoaringBitmap>> {
+        let mut bitmap = RoaringBitmap::new();
+        let Some(fragments) = &self.fragments else {
+            return None;
+        };
+        for fragment in fragments.iter() {
+            bitmap.insert(fragment.id as u32);
+        }
+        Some(Arc::new(bitmap))
+    }
+
     async fn plan_fts(
         &self,
         query: &FtsQuery,
@@ -1849,12 +1860,15 @@ impl Scanner {
                 self.plan_match_query(query, params, filter_plan, prefilter_source)
                     .await?
             }
-            FtsQuery::Phrase(query) => Arc::new(PhraseQueryExec::new(
-                self.dataset.clone(),
-                query.clone(),
-                params.clone(),
-                prefilter_source.clone(),
-            )),
+            FtsQuery::Phrase(query) => Arc::new(
+                PhraseQueryExec::new(
+                    self.dataset.clone(),
+                    query.clone(),
+                    params.clone(),
+                    prefilter_source.clone(),
+                )
+                .with_fragments(self.fragments_bitmap()),
+            ),
 
             FtsQuery::Boost(query) => {
                 // for boost query, we need to erase the limit so that we can find
@@ -2037,12 +2051,15 @@ impl Scanner {
             ))?;
 
         let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
-        let mut match_plan: Arc<dyn ExecutionPlan> = Arc::new(MatchQueryExec::new(
-            self.dataset.clone(),
-            query.clone(),
-            params.clone(),
-            prefilter_source.clone(),
-        ));
+        let mut match_plan: Arc<dyn ExecutionPlan> = Arc::new(
+            MatchQueryExec::new(
+                self.dataset.clone(),
+                query.clone(),
+                params.clone(),
+                prefilter_source.clone(),
+            )
+            .with_fragments(self.fragments_bitmap()),
+        );
         if !unindexed_fragments.is_empty() {
             let mut columns = vec![column.clone()];
             if let Some(expr) = filter_plan.full_expr.as_ref() {
@@ -5195,7 +5212,7 @@ mod test {
             plan,
             "AggregateExec: mode=Single, gby=[], aggr=[count_rows]
   ProjectionExec: expr=[_rowid@1 as _rowid]
-    FilterExec: s@0 = 
+    FilterExec: s@0 =
       LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=true",
         )
         .await

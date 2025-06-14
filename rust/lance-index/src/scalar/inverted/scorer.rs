@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use super::InvertedPartition;
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
 
 // the Scorer trait is used to calculate the score of a token in a document
 // in general, the score is calculated as:
@@ -16,30 +18,28 @@ pub trait Scorer: Send + Sync {
     fn score(&self, token: &str, freq: u32, doc_tokens: u32) -> f32 {
         self.query_weight(token) * self.doc_weight(freq, doc_tokens)
     }
+    fn merge(scorers: &[&Self]) -> Self;
 }
 
 // BM25 parameters
 pub const K1: f32 = 1.2;
 pub const B: f32 = 0.75;
 
-pub struct BM25Scorer<'a> {
-    partitions: Vec<&'a InvertedPartition>,
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BM25Scorer {
+    nqs: HashMap<String, usize>,
     num_docs: usize,
+    num_tokens: usize,
     avgdl: f32,
 }
 
-impl<'a> BM25Scorer<'a> {
-    pub fn new(partitions: impl Iterator<Item = &'a InvertedPartition>) -> Self {
-        let partitions = partitions.collect::<Vec<_>>();
-        let num_docs = partitions.iter().map(|p| p.docs.len()).sum();
-        let total_tokens = partitions
-            .iter()
-            .map(|part| part.docs.total_tokens_num())
-            .sum::<u64>();
-        let avgdl = total_tokens as f32 / num_docs as f32;
+impl BM25Scorer {
+    pub fn new(nqs: HashMap<String, usize>, num_docs: usize, num_tokens: usize) -> Self {
+        let avgdl = num_tokens as f32 / num_docs as f32;
         Self {
-            partitions,
+            nqs,
             num_docs,
+            num_tokens,
             avgdl,
         }
     }
@@ -54,20 +54,25 @@ impl<'a> BM25Scorer<'a> {
 
     // the number of documents that contain the token
     pub fn nq(&self, token: &str) -> usize {
-        self.partitions
-            .iter()
-            .map(|part| {
-                if let Some(token_id) = part.tokens.get(token) {
-                    part.inverted_list.posting_len(token_id)
-                } else {
-                    0
-                }
-            })
-            .sum()
+        *self.nqs.get(token).unwrap_or(&1)
     }
 }
 
-impl Scorer for BM25Scorer<'_> {
+impl Scorer for BM25Scorer {
+    fn merge(scorers: &[&Self]) -> Self {
+        let mut nqs = HashMap::new();
+        let mut num_docs = 0;
+        let mut num_tokens = 0;
+        for scorer in scorers {
+            for (token, nq) in scorer.nqs.iter() {
+                *nqs.entry(token.clone()).or_insert(0) += nq;
+            }
+            num_docs += scorer.num_docs;
+            num_tokens += scorer.num_tokens;
+        }
+        Self::new(nqs, num_docs, num_tokens)
+    }
+
     fn query_weight(&self, token: &str) -> f32 {
         let nq = self.nq(token);
         if nq == 0 {

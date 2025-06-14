@@ -2,11 +2,14 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use lance_core::{Error, Result};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use snafu::location;
+
+use crate::scalar::inverted::BM25Scorer;
 
 #[derive(Debug, Clone)]
 pub struct FtsSearchParams {
@@ -19,6 +22,7 @@ pub struct FtsSearchParams {
     pub phrase_slop: Option<u32>,
     /// The number of beginning characters being unchanged for fuzzy matching.
     pub prefix_length: u32,
+    pub scorer: Option<Arc<BM25Scorer>>,
 }
 
 impl FtsSearchParams {
@@ -30,7 +34,13 @@ impl FtsSearchParams {
             max_expansions: 50,
             phrase_slop: None,
             prefix_length: 0,
+            scorer: None,
         }
+    }
+
+    pub fn with_scorer(mut self, scorer: Option<Arc<BM25Scorer>>) -> Self {
+        self.scorer = scorer;
+        self
     }
 
     pub fn with_limit(mut self, limit: Option<usize>) -> Self {

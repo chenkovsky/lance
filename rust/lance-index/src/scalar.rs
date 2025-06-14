@@ -25,6 +25,7 @@ use lance_core::{Error, Result};
 use snafu::location;
 
 use crate::metrics::MetricsCollector;
+use crate::scalar::inverted::BM25Scorer;
 use crate::{Index, IndexParams, IndexType};
 
 pub mod bitmap;
@@ -236,6 +237,8 @@ pub struct FullTextSearchQuery {
     /// Increasing this value will reduce the recall and improve the performance
     /// 1.0 is the value that would give the best performance without recall loss
     pub wand_factor: Option<f32>,
+
+    pub scorer: Option<Arc<BM25Scorer>>,
 }
 
 impl FullTextSearchQuery {
@@ -246,6 +249,7 @@ impl FullTextSearchQuery {
             query,
             limit: None,
             wand_factor: None,
+            scorer: None,
         }
     }
 
@@ -256,6 +260,7 @@ impl FullTextSearchQuery {
             query,
             limit: None,
             wand_factor: None,
+            scorer: None,
         }
     }
 
@@ -265,7 +270,13 @@ impl FullTextSearchQuery {
             query,
             limit: None,
             wand_factor: None,
+            scorer: None,
         }
+    }
+
+    pub fn with_scorer(mut self, scorer: Option<Arc<BM25Scorer>>) -> Self {
+        self.scorer = scorer;
+        self
     }
 
     /// Set the column to search over
@@ -301,7 +312,8 @@ impl FullTextSearchQuery {
     pub fn params(&self) -> FtsSearchParams {
         let params = FtsSearchParams::new()
             .with_limit(self.limit.map(|limit| limit as usize))
-            .with_wand_factor(self.wand_factor.unwrap_or(1.0));
+            .with_wand_factor(self.wand_factor.unwrap_or(1.0))
+            .with_scorer(self.scorer.clone());
         match self.query {
             FtsQuery::Phrase(ref query) => params.with_phrase_slop(Some(query.slop)),
             _ => params,
@@ -615,4 +627,24 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<()>;
+
+    /// Remap the row ids, creating a new remapped version of this index in `dest_store` with an offset
+    async fn remap_with_offset(
+        &self,
+        _mapping: &HashMap<u64, Option<u64>>,
+        _dest_store: &dyn IndexStore,
+        _id_offset: u64,
+    ) -> Result<()> {
+        unimplemented!("only for inverted index")
+    }
+
+    /// Add the new data into the index, creating an updated version of the index in `dest_store` with an offset
+    async fn update_with_offset(
+        &self,
+        _new_data: SendableRecordBatchStream,
+        _dest_store: &dyn IndexStore,
+        _id_offset: u64,
+    ) -> Result<()> {
+        unimplemented!("only for inverted index")
+    }
 }

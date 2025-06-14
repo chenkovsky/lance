@@ -28,6 +28,7 @@ use crate::{
 use lance::index::vector::ivf::write_ivf_pq_file_from_existing_index;
 use lance_index::DatasetIndexExt;
 use uuid::Uuid;
+pub mod inverted;
 
 async fn do_train_ivf_model(
     dataset: &Dataset,

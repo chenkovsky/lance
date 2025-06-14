@@ -28,6 +28,7 @@ use lance_index::scalar::inverted::{
 use lance_index::scalar::ScalarIndexType;
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
 use lance_index::{DatasetIndexExt, ScalarIndexCriteria};
+use roaring::RoaringBitmap;
 use tracing::instrument;
 
 use crate::{index::DatasetIndexInternalExt, Dataset};
@@ -44,6 +45,7 @@ pub struct MatchQueryExec {
 
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
+    fragments: Option<Arc<RoaringBitmap>>,
 }
 
 impl DisplayAs for MatchQueryExec {
@@ -79,7 +81,11 @@ impl MatchQueryExec {
             prefilter_source,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
+            fragments: None,
         }
+    }
+    pub fn with_fragments(self, fragments: Option<Arc<RoaringBitmap>>) -> Self {
+        Self { fragments, ..self }
     }
 }
 
@@ -127,6 +133,7 @@ impl ExecutionPlan for MatchQueryExec {
                     prefilter_source: PreFilterSource::None,
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
+                    fragments: self.fragments.clone(),
                 }
             }
             1 => {
@@ -152,6 +159,7 @@ impl ExecutionPlan for MatchQueryExec {
                     prefilter_source,
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
+                    fragments: self.fragments.clone(),
                 }
             }
             _ => {
@@ -174,6 +182,7 @@ impl ExecutionPlan for MatchQueryExec {
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
         let metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
+        let fragments = self.fragments.clone();
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
             query.terms
@@ -235,6 +244,7 @@ impl ExecutionPlan for MatchQueryExec {
                     query.operator,
                     pre_filter,
                     metrics,
+                    fragments,
                 )
                 .boxed()
                 .await?;
@@ -394,12 +404,9 @@ impl ExecutionPlan for FlatMatchQueryExec {
                         column,
                     ))
                 })?;
-            Ok::<_, DataFusionError>(flat_bm25_search_stream(
-                unindexed_input,
-                column,
-                query.terms,
-                inverted_idx,
-            ))
+            flat_bm25_search_stream(unindexed_input, column, query.terms, inverted_idx)
+                .await
+                .map_err(|e| DataFusionError::Execution(e.to_string()))
         })
         .try_flatten_unordered(None);
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
@@ -431,6 +438,7 @@ pub struct PhraseQueryExec {
     prefilter_source: PreFilterSource,
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
+    fragments: Option<Arc<RoaringBitmap>>,
 }
 
 impl DisplayAs for PhraseQueryExec {
@@ -468,7 +476,11 @@ impl PhraseQueryExec {
             prefilter_source,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
+            fragments: None,
         }
+    }
+    pub fn with_fragments(self, fragments: Option<Arc<RoaringBitmap>>) -> Self {
+        Self { fragments, ..self }
     }
 }
 
@@ -509,6 +521,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 prefilter_source: PreFilterSource::None,
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
+                fragments: self.fragments.clone(),
             },
             1 => {
                 let src = children.pop().unwrap();
@@ -532,6 +545,7 @@ impl ExecutionPlan for PhraseQueryExec {
                     prefilter_source,
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
+                    fragments: self.fragments.clone(),
                 }
             }
             _ => {
@@ -554,6 +568,7 @@ impl ExecutionPlan for PhraseQueryExec {
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
         let metrics = Arc::new(IndexMetrics::new(&self.metrics, partition));
+        let fragments = self.fragments.clone();
         let stream = stream::once(async move {
             let column = query.column.ok_or(DataFusionError::Execution(format!(
                 "column not set for PhraseQuery {}",
@@ -604,6 +619,7 @@ impl ExecutionPlan for PhraseQueryExec {
                     lance_index::scalar::inverted::query::Operator::And,
                     pre_filter,
                     metrics,
+                    fragments,
                 )
                 .boxed()
                 .await?;

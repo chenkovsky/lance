@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use lance_core::Result;
 
-use crate::scalar::IndexStore;
+use crate::scalar::{inverted::InvertedPartitionMetadata, IndexStore};
 
 use super::{
     builder::{doc_file_path, posting_file_path, token_file_path, InnerBuilder, PositionRecorder},
@@ -17,7 +17,7 @@ pub trait Merger {
     // the new partitions are returned.
     // This method would read all the input partitions at the same time,
     // so it's not recommended to pass too many partitions.
-    async fn merge(&mut self) -> Result<Vec<u64>>;
+    async fn merge(&mut self) -> Result<Vec<Arc<InvertedPartitionMetadata>>>;
 }
 
 // A merger that merges partitions based on their size,
@@ -29,7 +29,7 @@ pub struct SizeBasedMerger<'a> {
     input: Vec<InvertedPartition>,
     target_size: u64,
     builder: InnerBuilder,
-    partitions: Vec<u64>,
+    partitions: Vec<Arc<InvertedPartitionMetadata>>,
 }
 
 impl<'a> SizeBasedMerger<'a> {
@@ -62,7 +62,13 @@ impl<'a> SizeBasedMerger<'a> {
                 self.builder.id(),
                 start.elapsed()
             );
-            self.partitions.push(self.builder.id());
+            self.partitions
+                .push(Arc::new(InvertedPartitionMetadata::new(
+                    self.builder.id(),
+                    self.builder.tokens.len(),
+                    self.builder.docs.len(),
+                    self.builder.docs.fragment_ids(),
+                )));
             self.builder = InnerBuilder::new(self.builder.id() + 1);
         }
         Ok(())
@@ -70,7 +76,7 @@ impl<'a> SizeBasedMerger<'a> {
 }
 
 impl Merger for SizeBasedMerger<'_> {
-    async fn merge(&mut self) -> Result<Vec<u64>> {
+    async fn merge(&mut self) -> Result<Vec<Arc<InvertedPartitionMetadata>>> {
         if self.input.len() <= 1 {
             for part in self.input.iter() {
                 part.store()
@@ -83,8 +89,11 @@ impl Merger for SizeBasedMerger<'_> {
                     .copy_index_file(&doc_file_path(part.id()), self.dest_store)
                     .await?;
             }
-
-            return Ok(self.input.iter().map(|p| p.id()).collect());
+            return Ok(self
+                .input
+                .iter()
+                .map(|p| p.metadata().clone())
+                .collect::<Vec<_>>());
         }
 
         // for token set, union the tokens,

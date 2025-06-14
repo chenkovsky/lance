@@ -71,9 +71,9 @@ lazy_static! {
 #[derive(Debug)]
 pub struct InvertedIndexBuilder {
     params: InvertedIndexParams,
-    partitions: Vec<u64>,
-    new_partitions: Vec<u64>,
-
+    partitions: Vec<Arc<InvertedPartitionMetadata>>,
+    new_partitions: Vec<Arc<InvertedPartitionMetadata>>,
+    id_offset: Option<u64>,
     _tmpdir: TempDir,
     local_store: Arc<dyn IndexStore>,
     src_store: Arc<dyn IndexStore>,
@@ -81,13 +81,18 @@ pub struct InvertedIndexBuilder {
 
 impl InvertedIndexBuilder {
     pub fn new(params: InvertedIndexParams) -> Self {
-        Self::from_existing_index(params, None, Vec::new())
+        Self::new_with_offset(params, None)
+    }
+
+    pub fn new_with_offset(params: InvertedIndexParams, id_offset: Option<u64>) -> Self {
+        Self::from_existing_index(params, None, Vec::new(), id_offset)
     }
 
     pub fn from_existing_index(
         params: InvertedIndexParams,
         store: Option<Arc<dyn IndexStore>>,
-        partitions: Vec<u64>,
+        partitions: Vec<Arc<InvertedPartitionMetadata>>,
+        id_offset: Option<u64>,
     ) -> Self {
         let tmpdir = tempdir().unwrap();
         let local_store = Arc::new(LanceIndexStore::new(
@@ -103,6 +108,7 @@ impl InvertedIndexBuilder {
             _tmpdir: tmpdir,
             local_store,
             src_store,
+            id_offset,
         }
     }
 
@@ -112,7 +118,12 @@ impl InvertedIndexBuilder {
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
         self.update_index(new_data).await?;
-        self.write(dest_store).await?;
+        self.merge_partitions(dest_store).await?;
+        if self.id_offset.is_none() {
+            // only in single node mode, we write the metadata to the dest_store
+            // in distributed mode, the metadata is written by the coordinator
+            self.write_metadata(dest_store, &self.partitions).await?;
+        }
         Ok(())
     }
 
@@ -138,7 +149,12 @@ impl InvertedIndexBuilder {
         let num_workers = *LANCE_FTS_NUM_SHARDS;
         let tokenizer = self.params.build()?;
         let with_position = self.params.with_position;
-        let next_id = self.partitions.iter().map(|id| id + 1).max().unwrap_or(0);
+        let next_id = self
+            .partitions
+            .iter()
+            .map(|part| part.id + 1)
+            .max()
+            .unwrap_or(0);
         let id_alloc = Arc::new(AtomicU64::new(next_id));
         let (sender, receiver) = async_channel::bounded(num_workers);
         let mut index_tasks = Vec::with_capacity(num_workers);
@@ -147,14 +163,15 @@ impl InvertedIndexBuilder {
             let tokenizer = tokenizer.clone();
             let receiver = receiver.clone();
             let id_alloc = id_alloc.clone();
+            let id_offset = self.id_offset;
             let task = tokio::task::spawn(async move {
                 let mut worker =
-                    IndexWorker::new(store, tokenizer, with_position, id_alloc).await?;
+                    IndexWorker::new(store, tokenizer, with_position, id_alloc, id_offset).await?;
                 while let Ok(batch) = receiver.recv().await {
                     worker.process_batch(batch).await?;
                 }
-                let partitions = worker.finish().await?;
-                Result::Ok(partitions)
+                let result = worker.finish().await?;
+                Result::Ok(result)
             });
             index_tasks.push(task);
         }
@@ -191,7 +208,8 @@ impl InvertedIndexBuilder {
         // wait for the workers to finish
         let start = std::time::Instant::now();
         for index_task in index_tasks {
-            self.new_partitions.extend(index_task.await??);
+            let partitions = index_task.await??;
+            self.new_partitions.extend(partitions);
         }
         log::info!("wait workers indexing elapsed: {:?}", start.elapsed());
         Ok(())
@@ -204,18 +222,28 @@ impl InvertedIndexBuilder {
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
         for part in self.partitions.iter() {
-            let part = InvertedPartition::load(src_store.clone(), *part).await?;
+            let part = InvertedPartition::load(src_store.clone(), part.clone()).await?;
             let mut builder = part.into_builder().await?;
             builder.remap(mapping).await?;
             builder.write(dest_store).await?;
         }
-        self.write_metadata(dest_store, &self.partitions).await?;
+        if self.id_offset.is_none() {
+            self.write_metadata(dest_store, &self.partitions).await?;
+        }
         Ok(())
     }
 
-    async fn write_metadata(&self, dest_store: &dyn IndexStore, partitions: &[u64]) -> Result<()> {
+    async fn write_metadata(
+        &self,
+        dest_store: &dyn IndexStore,
+        partitions: &[Arc<InvertedPartitionMetadata>],
+    ) -> Result<()> {
+        let partitions = partitions
+            .iter()
+            .map(|part| part.as_ref())
+            .collect::<Vec<_>>();
         let metadata = HashMap::from_iter(vec![
-            ("partitions".to_owned(), serde_json::to_string(&partitions)?),
+            ("partitions".to_owned(), serde_json::to_string(&partitions)?), // TODO: use protobuf instead of json
             ("params".to_owned(), serde_json::to_string(&self.params)?),
         ]);
         let mut writer = dest_store
@@ -225,22 +253,25 @@ impl InvertedIndexBuilder {
         Ok(())
     }
 
-    async fn write(&self, dest_store: &dyn IndexStore) -> Result<()> {
-        let partitions = futures::future::try_join_all(
-            self.partitions
-                .iter()
-                .map(|part| InvertedPartition::load(self.src_store.clone(), *part))
-                .chain(
-                    self.new_partitions
-                        .iter()
-                        .map(|part| InvertedPartition::load(self.local_store.clone(), *part)),
-                ),
-        )
-        .await?;
+    async fn merge_partitions(
+        &mut self,
+        dest_store: &dyn IndexStore,
+    ) -> Result<&[Arc<InvertedPartitionMetadata>]> {
+        let partitions =
+            futures::future::try_join_all(
+                self.partitions
+                    .iter()
+                    .map(|part| InvertedPartition::load(self.src_store.clone(), part.clone()))
+                    .chain(self.new_partitions.iter().map(|part| {
+                        InvertedPartition::load(self.local_store.clone(), part.clone())
+                    })),
+            )
+            .await?;
         let mut merger = SizeBasedMerger::new(dest_store, partitions, *LANCE_FTS_TARGET_SIZE << 20);
         let partitions = merger.merge().await?;
-        self.write_metadata(dest_store, &partitions).await?;
-        Ok(())
+        self.partitions = partitions;
+        self.new_partitions.clear();
+        Ok(&self.partitions)
     }
 }
 
@@ -261,6 +292,15 @@ pub struct InnerBuilder {
 }
 
 impl InnerBuilder {
+    pub fn metadata(&self) -> InvertedPartitionMetadata {
+        InvertedPartitionMetadata::new(
+            self.id,
+            self.docs.total_tokens_num() as usize,
+            self.docs.len(),
+            self.docs.fragment_ids(),
+        )
+    }
+
     pub fn new(id: u64) -> Self {
         Self {
             id,
@@ -391,10 +431,10 @@ struct IndexWorker {
     tokenizer: tantivy::tokenizer::TextAnalyzer,
     id_alloc: Arc<AtomicU64>,
     builder: InnerBuilder,
-    partitions: Vec<u64>,
+    partitions: Vec<Arc<InvertedPartitionMetadata>>,
     schema: SchemaRef,
     estimated_size: u64,
-    total_doc_length: usize,
+    id_offset: Option<u64>,
 }
 
 impl IndexWorker {
@@ -403,18 +443,22 @@ impl IndexWorker {
         tokenizer: tantivy::tokenizer::TextAnalyzer,
         with_position: bool,
         id_alloc: Arc<AtomicU64>,
+        id_offset: Option<u64>,
     ) -> Result<Self> {
         let schema = inverted_list_schema(with_position);
 
         Ok(Self {
             store,
             tokenizer,
-            builder: InnerBuilder::new(id_alloc.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+            builder: InnerBuilder::new(
+                id_alloc.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    | id_offset.unwrap_or(0),
+            ),
             partitions: Vec::new(),
             id_alloc,
             schema,
             estimated_size: 0,
-            total_doc_length: 0,
+            id_offset,
         })
     }
 
@@ -453,7 +497,6 @@ impl IndexWorker {
                     PostingListBuilder::new(with_position)
                 });
             let doc_id = self.builder.docs.append(row_id, token_num);
-            self.total_doc_length += doc.len();
 
             token_occurrences
                 .into_iter()
@@ -491,16 +534,16 @@ impl IndexWorker {
             &mut self.builder,
             InnerBuilder::new(
                 self.id_alloc
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    | self.id_offset.unwrap_or(0),
             ),
         );
         builder.write(self.store.as_ref()).await?;
-        self.partitions.push(builder.id);
-
+        self.partitions.push(Arc::new(builder.metadata()));
         Ok(())
     }
 
-    async fn finish(mut self) -> Result<Vec<u64>> {
+    async fn finish(mut self) -> Result<Vec<Arc<InvertedPartitionMetadata>>> {
         if !self.builder.tokens.is_empty() {
             self.flush().await?;
         }

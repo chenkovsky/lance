@@ -45,6 +45,7 @@ use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lazy_static::lazy_static;
 use moka::future::Cache;
 use roaring::RoaringBitmap;
+use serde::{Deserialize, Serialize};
 use snafu::location;
 use tracing::{info, instrument};
 
@@ -100,6 +101,15 @@ lazy_static! {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(512 * 1024 * 1024);
+    pub static ref PARTITION_CACHE_SIZE: Option<usize> =
+        std::env::var("LANCE_INVERTED_PARTITION_CACHE_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok());
+    pub static ref LAZY_PARTITION_CACHE: bool =
+        std::env::var("LANCE_INVERTED_LAZY_PARTITION_CACHE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(false);
 }
 
 #[derive(Clone)]
@@ -107,7 +117,106 @@ pub struct InvertedIndex {
     params: InvertedIndexParams,
     store: Arc<dyn IndexStore>,
     tokenizer: tantivy::tokenizer::TextAnalyzer,
-    pub(crate) partitions: Vec<Arc<InvertedPartition>>,
+    partitions: Vec<Arc<InvertedPartitionMetadata>>,
+    partition_pool: Arc<dyn PartitionPool>,
+    legacy: bool,
+}
+
+#[async_trait]
+pub(crate) trait PartitionPool: DeepSizeOf + Send + Sync {
+    async fn partition(
+        &self,
+        part: Arc<InvertedPartitionMetadata>,
+    ) -> Result<Arc<InvertedPartition>>;
+    fn parallelism(&self) -> usize;
+}
+
+#[derive(Debug, Clone)]
+struct CachedPartitionPool {
+    cache: Cache<u64, Arc<InvertedPartition>>,
+    store: Arc<dyn IndexStore>,
+}
+
+impl CachedPartitionPool {
+    fn build_partition_cache() -> Cache<u64, Arc<InvertedPartition>> {
+        let mut cache =
+            Cache::builder().weigher(|_, part: &Arc<InvertedPartition>| part.deep_size_of() as u32);
+        if let Some(size) = PARTITION_CACHE_SIZE.as_ref() {
+            cache = cache.max_capacity(*size as u64);
+        }
+        cache.build()
+    }
+    fn new(store: Arc<dyn IndexStore>) -> Self {
+        let cache = Self::build_partition_cache();
+        Self { cache, store }
+    }
+}
+
+#[async_trait]
+impl PartitionPool for CachedPartitionPool {
+    async fn partition(
+        &'_ self,
+        part: Arc<InvertedPartitionMetadata>,
+    ) -> Result<Arc<InvertedPartition>> {
+        self.cache
+            .try_get_with(part.id, async move {
+                let part = InvertedPartition::load(self.store.clone(), part).await?;
+                Ok(Arc::new(part))
+            })
+            .await
+            .map_err(|e: std::sync::Arc<Error>| Error::io(e.to_string(), location!()))
+    }
+
+    fn parallelism(&self) -> usize {
+        self.store.io_parallelism()
+    }
+}
+
+impl DeepSizeOf for CachedPartitionPool {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        self.cache.weighted_size() as usize
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MemoryPartitionPool {
+    partitions: HashMap<u64, Arc<InvertedPartition>>,
+}
+
+impl MemoryPartitionPool {
+    fn new(partitions: Vec<Arc<InvertedPartition>>) -> Self {
+        let partitions = partitions
+            .into_iter()
+            .map(|part| (part.id(), part))
+            .collect();
+        Self { partitions }
+    }
+}
+
+#[async_trait]
+impl PartitionPool for MemoryPartitionPool {
+    async fn partition(
+        &'_ self,
+        part: Arc<InvertedPartitionMetadata>,
+    ) -> Result<Arc<InvertedPartition>> {
+        self.partitions
+            .get(&part.id)
+            .cloned()
+            .ok_or_else(|| Error::io(format!("Partition {} not found", part.id), location!()))
+    }
+
+    fn parallelism(&self) -> usize {
+        get_num_compute_intensive_cpus()
+    }
+}
+
+impl DeepSizeOf for MemoryPartitionPool {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        self.partitions
+            .iter()
+            .map(|(_, part)| part.deep_size_of())
+            .sum::<usize>()
+    }
 }
 
 impl Debug for InvertedIndex {
@@ -120,21 +229,80 @@ impl Debug for InvertedIndex {
 }
 
 impl DeepSizeOf for InvertedIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.partitions.deep_size_of_children(context)
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        self.partition_pool.deep_size_of()
     }
 }
 
 impl InvertedIndex {
     fn to_builder(&self) -> InvertedIndexBuilder {
+        self.to_builder_with_offset(None)
+    }
+
+    pub fn partitions(&self) -> &[Arc<InvertedPartitionMetadata>] {
+        &self.partitions
+    }
+
+    pub async fn fuzzy_nq(
+        &self,
+        tokens: &HashSet<String>,
+        params: &FtsSearchParams,
+        partition_ids: Option<&Vec<u64>>,
+    ) -> Result<HashMap<String, usize>> {
+        let tokens = tokens.iter().map(|t| t.clone()).collect::<Vec<_>>();
+        let parts = self
+            .partitions
+            .iter()
+            .filter_map(|part| {
+                if let Some(partition_ids) = partition_ids {
+                    if !partition_ids.contains(&part.id) {
+                        return None;
+                    }
+                }
+                let partition_pool = self.partition_pool.clone();
+                let metadata = part.clone();
+                let tokens = tokens.clone();
+                let params = params.clone();
+                Some(tokio::spawn(async move {
+                    let part = partition_pool.partition(metadata).await?;
+                    let tokens = part.expand_fuzzy(&tokens, &params)?;
+                    let nq = part.nq(&tokens);
+                    Ok::<_, Error>(nq)
+                }))
+            })
+            .collect::<Vec<_>>();
+
+        let mut parts = stream::iter(parts).buffer_unordered(self.partition_pool.parallelism());
+        let mut ret = HashMap::new();
+        while let Some(nq) = parts.try_next().await? {
+            let nq = nq?;
+            for (k, v) in nq.iter() {
+                ret.entry(k.clone()).and_modify(|e| *e += v).or_insert(*v);
+            }
+        }
+        Ok(ret)
+    }
+
+    fn to_builder_with_offset(&self, id_offset: Option<u64>) -> InvertedIndexBuilder {
         if self.is_legacy() {
             // for legacy format, we re-create the index in the new format
-            InvertedIndexBuilder::new(self.params.clone())
+            InvertedIndexBuilder::new_with_offset(self.params.clone(), id_offset)
         } else {
+            let partitions = match id_offset {
+                Some(id_offset) => self
+                    .partitions
+                    .iter()
+                    .filter(|part| part.id & id_offset == id_offset)
+                    .cloned()
+                    .collect(),
+                None => self.partitions.clone(),
+            };
+
             InvertedIndexBuilder::from_existing_index(
                 self.params.clone(),
                 Some(self.store.clone()),
-                self.partitions.iter().map(|part| part.id).collect(),
+                partitions,
+                id_offset,
             )
         }
     }
@@ -145,6 +313,26 @@ impl InvertedIndex {
 
     pub fn params(&self) -> &InvertedIndexParams {
         &self.params
+    }
+
+    async fn scorer(&self, tokens: &Arc<Vec<String>>) -> Result<BM25Scorer> {
+        let parts = self
+            .partitions
+            .iter()
+            .map(|part| {
+                let partition_pool = self.partition_pool.clone();
+                let metadata = part.clone();
+                let tokens = tokens.clone();
+                tokio::spawn(
+                    async move { Ok(partition_pool.partition(metadata).await?.scorer(tokens)) },
+                )
+            })
+            .collect::<Vec<_>>();
+        let parts = stream::iter(parts).buffer_unordered(self.partition_pool.parallelism());
+        let scorers = parts.try_collect::<Vec<_>>().await?;
+        let scorers = scorers.into_iter().map(|s| s).collect::<Result<Vec<_>>>()?;
+        let scorers = scorers.iter().collect::<Vec<_>>();
+        Ok(BM25Scorer::merge(&scorers))
     }
 
     // search the documents that contain the query
@@ -160,6 +348,7 @@ impl InvertedIndex {
         operator: Operator,
         prefilter: Arc<dyn PreFilter>,
         metrics: Arc<dyn MetricsCollector>,
+        fragments: Option<Arc<RoaringBitmap>>,
     ) -> Result<(Vec<u64>, Vec<f32>)> {
         let limit = params.limit.unwrap_or(usize::MAX);
         if limit == 0 {
@@ -170,13 +359,24 @@ impl InvertedIndex {
         let parts = self
             .partitions
             .iter()
+            .filter(|part| {
+                if let Some(fragments) = &fragments {
+                    part.fragments
+                        .iter()
+                        .any(|fragment| fragments.contains(*fragment))
+                } else {
+                    true
+                }
+            })
             .map(|part| {
-                let part = part.clone();
+                let metadata = part.clone();
                 let tokens = tokens.clone();
                 let params = params.clone();
                 let mask = mask.clone();
                 let metrics = metrics.clone();
+                let partition_pool = self.partition_pool.clone();
                 tokio::spawn(async move {
+                    let part = partition_pool.partition(metadata).await?;
                     part.bm25_search(
                         tokens.as_ref(),
                         params.as_ref(),
@@ -188,14 +388,19 @@ impl InvertedIndex {
                 })
             })
             .collect::<Vec<_>>();
-        let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
-        let scorer = BM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
+        let mut parts = stream::iter(parts).buffer_unordered(self.partition_pool.parallelism());
+        let scorer = params.as_ref().scorer.clone();
+        let scorer = match scorer {
+            Some(scorer) => scorer,
+            None => Arc::new(self.scorer(&tokens).await?),
+        };
         while let Some(res) = parts.try_next().await? {
             for (row_id, freq, length) in res? {
                 let mut score = 0.0;
                 for token in tokens.iter() {
                     score += scorer.score(token, freq, length);
                 }
+
                 if candidates.len() < limit {
                     candidates.push(Reverse(ScoredDoc::new(row_id, score)));
                 } else if candidates.peek().unwrap().0.score.0 < score {
@@ -248,25 +453,53 @@ impl InvertedIndex {
         let (tokenizer_config, tokens) = tokens_fut.await??;
         let inverted_list = invert_list_fut.await??;
         let docs = docs_fut.await??;
+        let num_tokens = docs.total_tokens_num() as usize;
+        let num_docs = docs.len();
 
         let tokenizer = tokenizer_config.build()?;
-
-        Ok(Arc::new(Self {
-            params: tokenizer_config,
-            store: store.clone(),
-            tokenizer,
-            partitions: vec![Arc::new(InvertedPartition {
-                id: 0,
-                store,
+        let metadata = Arc::new(InvertedPartitionMetadata::new(
+            0,
+            num_tokens,
+            num_docs,
+            docs.fragment_ids(),
+        ));
+        let partitions = vec![metadata.clone()];
+        let partition_pool = Arc::new(MemoryPartitionPool::new(vec![Arc::new(
+            InvertedPartition {
+                metadata,
+                store: store.clone(),
                 tokens,
                 inverted_list,
                 docs,
-            })],
+            },
+        )]));
+
+        Ok(Arc::new(Self {
+            params: tokenizer_config,
+            store,
+            tokenizer,
+            partitions,
+            partition_pool,
+            legacy: true,
         }))
     }
 
     pub fn is_legacy(&self) -> bool {
-        self.partitions.len() == 1 && self.partitions[0].is_legacy()
+        self.legacy
+    }
+
+    pub fn num_docs(&self) -> usize {
+        self.partitions
+            .iter()
+            .map(|part| part.num_docs)
+            .sum::<usize>()
+    }
+
+    pub fn num_tokens(&self) -> usize {
+        self.partitions
+            .iter()
+            .map(|part| part.num_tokens)
+            .sum::<usize>()
     }
 }
 
@@ -288,25 +521,16 @@ impl Index for InvertedIndex {
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
-        let num_tokens = self
-            .partitions
-            .iter()
-            .map(|part| part.tokens.len())
-            .sum::<usize>();
-        let num_docs = self
-            .partitions
-            .iter()
-            .map(|part| part.docs.len())
-            .sum::<usize>();
         Ok(serde_json::json!({
             "params": self.params,
-            "num_tokens": num_tokens,
-            "num_docs": num_docs,
+            "num_tokens": self.num_tokens(),
+            "num_docs": self.num_docs(),
         }))
     }
 
     async fn prewarm(&self) -> Result<()> {
         for part in &self.partitions {
+            let part = self.partition_pool.partition(part.clone()).await?;
             part.inverted_list.prewarm().await?;
         }
         Ok(())
@@ -365,22 +589,35 @@ impl ScalarIndex for InvertedIndex {
                             message: "partitions not found in metadata".to_owned(),
                             location: location!(),
                         })?;
-                let partitions: Vec<u64> = serde_json::from_str(partitions)?;
-
-                let partitions = partitions.into_iter().map(|id| {
-                    let store = store.clone();
-                    async move { Result::Ok(Arc::new(InvertedPartition::load(store, id).await?)) }
-                });
-                let partitions = stream::iter(partitions)
-                    .buffer_unordered(store.io_parallelism())
-                    .try_collect::<Vec<_>>()
-                    .await?;
+                let partitions: Vec<InvertedPartitionMetadata> = serde_json::from_str(partitions)?;
+                let partitions = partitions
+                    .into_iter()
+                    .map(|part| Arc::new(part))
+                    .collect::<Vec<_>>();
                 let tokenizer = params.build()?;
+                let partition_pool: Arc<dyn PartitionPool> = if !*LAZY_PARTITION_CACHE {
+                    let partitions = partitions.clone();
+                    let partitions = partitions.into_iter().map(|metadata| {
+                        let store = store.clone();
+                        async move {
+                            Result::Ok(Arc::new(InvertedPartition::load(store, metadata).await?))
+                        }
+                    });
+                    let partitions = stream::iter(partitions)
+                        .buffer_unordered(store.io_parallelism())
+                        .try_collect::<Vec<_>>()
+                        .await?;
+                    Arc::new(MemoryPartitionPool::new(partitions))
+                } else {
+                    Arc::new(CachedPartitionPool::new(store.clone()))
+                };
                 Ok(Arc::new(Self {
                     params,
                     store,
                     tokenizer,
                     partitions,
+                    partition_pool,
+                    legacy: false,
                 }))
             }
             Err(_) => {
@@ -407,12 +644,69 @@ impl ScalarIndex for InvertedIndex {
     ) -> Result<()> {
         self.to_builder().update(new_data, dest_store).await
     }
+
+    async fn remap_with_offset(
+        &self,
+        mapping: &HashMap<u64, Option<u64>>,
+        dest_store: &dyn IndexStore,
+        id_offset: u64,
+    ) -> Result<()> {
+        self.to_builder_with_offset(Some(id_offset))
+            .remap(mapping, self.store.clone(), dest_store)
+            .await
+    }
+
+    async fn update_with_offset(
+        &self,
+        new_data: SendableRecordBatchStream,
+        dest_store: &dyn IndexStore,
+        id_offset: u64,
+    ) -> Result<()> {
+        self.to_builder_with_offset(Some(id_offset))
+            .update(new_data, dest_store)
+            .await
+    }
+}
+
+#[derive(Debug, Clone, DeepSizeOf, Default, Serialize, Deserialize)]
+pub struct InvertedPartitionMetadata {
+    pub(crate) id: u64,
+    pub(crate) num_tokens: usize,
+    pub(crate) num_docs: usize,
+    pub(crate) fragments: HashSet<u32>,
+}
+
+impl InvertedPartitionMetadata {
+    pub fn new(id: u64, num_tokens: usize, num_docs: usize, fragments: HashSet<u32>) -> Self {
+        Self {
+            id,
+            num_tokens,
+            num_docs,
+            fragments,
+        }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn num_tokens(&self) -> usize {
+        self.num_tokens
+    }
+
+    pub fn num_docs(&self) -> usize {
+        self.num_docs
+    }
+
+    pub fn fragments(&self) -> &HashSet<u32> {
+        &self.fragments
+    }
 }
 
 #[derive(Debug, Clone, DeepSizeOf)]
 pub struct InvertedPartition {
     // None for legacy format
-    id: u64,
+    metadata: Arc<InvertedPartitionMetadata>,
     store: Arc<dyn IndexStore>,
     pub(crate) tokens: TokenSet,
     pub(crate) inverted_list: Arc<PostingListReader>,
@@ -421,7 +715,11 @@ pub struct InvertedPartition {
 
 impl InvertedPartition {
     pub fn id(&self) -> u64 {
-        self.id
+        self.metadata.id
+    }
+
+    pub fn metadata(&self) -> &Arc<InvertedPartitionMetadata> {
+        &self.metadata
     }
 
     pub fn store(&self) -> &dyn IndexStore {
@@ -432,16 +730,37 @@ impl InvertedPartition {
         self.inverted_list.lengths.is_none()
     }
 
-    pub async fn load(store: Arc<dyn IndexStore>, id: u64) -> Result<Self> {
-        let token_file = store.open_index_file(&token_file_path(id)).await?;
+    pub fn nq(&self, tokens: &[String]) -> HashMap<String, usize> {
+        let mut nqs = HashMap::new();
+        for token in tokens.iter() {
+            if let Some(token_id) = self.tokens.get(token) {
+                *nqs.entry(token.to_string()).or_insert(0) +=
+                    self.inverted_list.posting_len(token_id);
+            }
+        }
+        nqs
+    }
+
+    pub fn scorer(&self, tokens: Arc<Vec<String>>) -> BM25Scorer {
+        let nqs = self.nq(&tokens);
+        BM25Scorer::new(nqs, self.docs.len(), self.docs.total_tokens_num() as usize)
+    }
+
+    pub async fn load(
+        store: Arc<dyn IndexStore>,
+        metadata: Arc<InvertedPartitionMetadata>,
+    ) -> Result<Self> {
+        let token_file = store.open_index_file(&token_file_path(metadata.id)).await?;
         let tokens = TokenSet::load(token_file).await?;
-        let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
+        let invert_list_file = store
+            .open_index_file(&posting_file_path(metadata.id))
+            .await?;
         let inverted_list = PostingListReader::try_new(invert_list_file).await?;
-        let docs_file = store.open_index_file(&doc_file_path(id)).await?;
+        let docs_file = store.open_index_file(&doc_file_path(metadata.id)).await?;
         let docs = DocSet::load(docs_file, false).await?;
 
         Ok(Self {
-            id,
+            metadata,
             store,
             tokens,
             inverted_list: Arc::new(inverted_list),
@@ -494,7 +813,7 @@ impl InvertedPartition {
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
     #[instrument(level = "debug", skip_all)]
     pub async fn bm25_search(
-        &self,
+        self: &Arc<Self>,
         tokens: &[String],
         params: &FtsSearchParams,
         operator: Operator,
@@ -507,6 +826,7 @@ impl InvertedPartition {
             true => self.expand_fuzzy(tokens, params)?,
             false => tokens.to_vec(),
         };
+        let scorer = self.scorer(Arc::new(tokens.clone()));
         let mut token_ids = Vec::with_capacity(tokens.len());
         for token in tokens {
             let token_id = self.map(&token);
@@ -546,13 +866,12 @@ impl InvertedPartition {
             .buffered(self.store.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
-        let scorer = BM25Scorer::new(std::iter::once(self));
         let mut wand = Wand::new(operator, postings.into_iter(), &self.docs, scorer);
         wand.search(params, mask, metrics)
     }
 
     pub async fn into_builder(self) -> Result<InnerBuilder> {
-        let mut builder = InnerBuilder::new(self.id);
+        let mut builder = InnerBuilder::new(self.id());
         builder.tokens = self.tokens;
         builder.docs = self.docs;
 
@@ -1015,7 +1334,7 @@ impl PostingListReader {
                 .await.map_err(|e| {
                     match e {
                         Error::Schema { .. } => Error::Index {
-                            message: "position is not found but required for phrase queries, try recreating the index with position".to_owned(), 
+                            message: "position is not found but required for phrase queries, try recreating the index with position".to_owned(),
                             location: location!(),
                         },
                         e => e
@@ -1648,6 +1967,13 @@ impl DocSet {
         self.row_ids[doc_id as usize]
     }
 
+    pub fn fragment_ids(&self) -> HashSet<u32> {
+        self.row_ids
+            .iter()
+            .map(|row_id| (row_id >> 32) as u32)
+            .collect()
+    }
+
     pub fn row_range(&self) -> RangeInclusive<u64> {
         self.row_ids[0]..=self.row_ids[self.len() - 1]
     }
@@ -1887,24 +2213,24 @@ pub fn flat_bm25_search(
     Ok(batch)
 }
 
-pub fn flat_bm25_search_stream(
+pub async fn flat_bm25_search_stream(
     input: SendableRecordBatchStream,
     doc_col: String,
     query: String,
     index: &InvertedIndex,
-) -> SendableRecordBatchStream {
+) -> Result<SendableRecordBatchStream> {
     let mut tokenizer = index.tokenizer.clone();
     let tokens = collect_tokens(&query, &mut tokenizer, None)
         .into_iter()
         .sorted_unstable()
         .collect::<HashSet<_>>();
-
-    let bm25_scorer = BM25Scorer::new(index.partitions.iter().map(|p| p.as_ref()));
-    let num_docs = bm25_scorer.num_docs();
-    let avgdl = bm25_scorer.avgdl();
+    let token_vec = Arc::new(tokens.iter().cloned().collect::<Vec<_>>());
+    let scorer = index.scorer(&token_vec).await?;
+    let num_docs = scorer.num_docs();
+    let avgdl = scorer.avgdl();
     let mut nq = HashMap::with_capacity(tokens.len());
     for token in &tokens {
-        let token_nq = bm25_scorer.nq(token).max(1);
+        let token_nq = scorer.nq(token).max(1);
         nq.insert(token.clone(), token_nq);
     }
     let stream = input.map(move |batch| {
@@ -1930,7 +2256,10 @@ pub fn flat_bm25_search_stream(
         Ok(batch)
     });
 
-    Box::pin(RecordBatchStreamAdapter::new(FTS_SCHEMA.clone(), stream)) as SendableRecordBatchStream
+    Ok(
+        Box::pin(RecordBatchStreamAdapter::new(FTS_SCHEMA.clone(), stream))
+            as SendableRecordBatchStream,
+    )
 }
 
 pub fn is_phrase_query(query: &str) -> bool {
